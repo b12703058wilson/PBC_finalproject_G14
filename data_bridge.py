@@ -3,7 +3,7 @@ from datetime import datetime
 
 # ==============================
 # 建立資料庫連線的函式
-# 每次需要連線時呼叫，用完自動關閉
+# 每次需要連線時呼叫，用完透過 finally 自動關閉
 # 避免多個連線同時存在造成衝突
 # ==============================
 def get_connection():
@@ -14,7 +14,8 @@ def get_connection():
 # 【給計時組用】
 # ==============================================================
 
-def save_session(user_id, label_id, start_time, end_time,
+def save_session(user_id, label_id, mode, target_duration,
+                 start_time, end_time,
                  total_distraction_count, total_distraction_time):
     """
     讀書結束後，存一筆完整的讀書紀錄進資料庫
@@ -23,6 +24,8 @@ def save_session(user_id, label_id, start_time, end_time,
     參數：
         user_id                 : 使用者編號（目前固定傳 1）
         label_id                : 讀書標籤編號（對應 labels.id）
+        mode                    : 計時模式，傳 '番茄鐘' 或 '自訂'
+        target_duration         : 目標時長（分鐘），讓遊戲化組判斷是否達成
         start_time              : 開始時間（datetime 格式）
         end_time                : 結束時間（datetime 格式）
         total_distraction_count : 這次總共被干擾幾次
@@ -35,29 +38,32 @@ def save_session(user_id, label_id, start_time, end_time,
         # 計算實際讀書時長（分鐘）
         actual_duration = int((end_time - start_time).total_seconds() / 60)
 
-        # 取得目前最大的 session id，新的 id 就是最大值 + 1
-        new_id = con.sql("SELECT COALESCE(MAX(id), 0) FROM sessions").fetchone()[0] + 1
-
-        # 把這次讀書紀錄存進 sessions 資料表
+        # 讓 Sequence 自動產生 id，不用手動計算
         con.sql("""
             INSERT INTO sessions (
-                id, user_id, label_id,
+                user_id, label_id, mode, target_duration,
                 start_time, end_time, actual_duration,
                 total_distraction_count, total_distraction_time
             )
-            VALUES ($id, $user_id, $label_id,
-                    $start_time, $end_time, $actual_duration,
-                    $total_distraction_count, $total_distraction_time)
+            VALUES (
+                $user_id, $label_id, $mode, $target_duration,
+                $start_time, $end_time, $actual_duration,
+                $total_distraction_count, $total_distraction_time
+            )
         """, params={
-            'id'                     : new_id,
             'user_id'                : user_id,
             'label_id'               : label_id,
+            'mode'                   : mode,
+            'target_duration'        : target_duration,
             'start_time'             : start_time,
             'end_time'               : end_time,
             'actual_duration'        : actual_duration,
             'total_distraction_count': total_distraction_count,
             'total_distraction_time' : total_distraction_time
         })
+
+        # 撈回剛剛新增的 session id
+        new_id = con.sql("SELECT MAX(id) FROM sessions").fetchone()[0]
 
         # 更新使用者的累積時數、上次讀書時間、最近一次 session id
         con.sql("""
@@ -76,7 +82,6 @@ def save_session(user_id, label_id, start_time, end_time,
         return new_id
 
     finally:
-        # 不管成功或失敗，最後都關閉連線
         con.close()
 
 
@@ -100,20 +105,19 @@ def save_distraction(session_id, type_id, start_time, end_time, overtime_thresho
         # 判斷是否超過門檻
         is_overtime = duration >= overtime_threshold
 
-        # 取得新的 id
-        new_id = con.sql("SELECT COALESCE(MAX(id), 0) FROM distractions").fetchone()[0] + 1
-
+        # 讓 Sequence 自動產生 id
         con.sql("""
             INSERT INTO distractions (
-                id, session_id, type_id,
+                session_id, type_id,
                 start_time, end_time, duration,
                 is_overtime, is_reminded
             )
-            VALUES ($id, $session_id, $type_id,
-                    $start_time, $end_time, $duration,
-                    $is_overtime, FALSE)
+            VALUES (
+                $session_id, $type_id,
+                $start_time, $end_time, $duration,
+                $is_overtime, FALSE
+            )
         """, params={
-            'id'         : new_id,
             'session_id' : session_id,
             'type_id'    : type_id,
             'start_time' : start_time,
@@ -129,7 +133,7 @@ def save_distraction(session_id, type_id, start_time, end_time, overtime_thresho
 def check_overtime_reminder(user_id):
     """
     讀書開始前呼叫，檢查上次是否有超時干擾還沒提醒過
-    如果有，回傳提醒訊息並標記為已提醒
+    如果有，回傳提醒資料並標記為已提醒
 
     參數：
         user_id : 使用者編號
@@ -151,7 +155,7 @@ def check_overtime_reminder(user_id):
         """, params={'user_id': user_id}).df()
 
         if len(result) > 0:
-            # 把這些紀錄標記為已提醒，下次就不會再跳出來
+            # 標記為已提醒，下次開啟就不會再跳出來
             con.sql("""
                 UPDATE distractions
                 SET is_reminded = TRUE
@@ -197,7 +201,7 @@ def update_exp_affection(user_id, exp_delta, affection_delta):
     """
     更新使用者的經驗值和好感度
     傳正數代表增加，傳負數代表扣除
-    好感度會被限制在 0~100 之間
+    好感度限制在 0~100 之間
 
     參數：
         exp_delta       : 經驗值變化量（例如 +10 或 -5）
@@ -262,6 +266,50 @@ def check_affection_decay(user_id, decay_threshold_hours=24, decay_amount=5):
         con.close()
 
 
+def get_last_session_result(user_id):
+    """
+    讀取最近一次讀書的結果
+    給遊戲化組判斷要給多少經驗值用
+
+    回傳：
+        {
+            'actual_duration'        : 實際讀書時長（分鐘）,
+            'target_duration'        : 目標時長（分鐘）,
+            'mode'                   : 計時模式,
+            'total_distraction_count': 干擾次數,
+            'total_distraction_time' : 總干擾時長（分鐘）,
+            'is_completed'           : 是否達成目標（actual >= target）
+        }
+    """
+    con = get_connection()
+    try:
+        result = con.sql("""
+            SELECT actual_duration, target_duration, mode,
+                   total_distraction_count, total_distraction_time
+            FROM sessions
+            WHERE user_id = $user_id
+            ORDER BY end_time DESC
+            LIMIT 1
+        """, params={'user_id': user_id}).fetchone()
+
+        # 如果完全沒有讀書紀錄，回傳 None
+        if result is None:
+            return None
+
+        return {
+            'actual_duration'        : result[0],
+            'target_duration'        : result[1],
+            'mode'                   : result[2],
+            'total_distraction_count': result[3],
+            'total_distraction_time' : result[4],
+            # 實際時長 >= 目標時長 就算達成
+            'is_completed'           : result[0] >= result[1]
+        }
+
+    finally:
+        con.close()
+
+
 def get_story_progress(user_id):
     """
     讀取使用者目前的劇情進度
@@ -315,7 +363,7 @@ def update_story_progress(user_id, chapter, branch=None):
 def get_stats(user_id):
     """
     讀取統計頁面需要的所有數據
-    對應介面截圖的「讀書統計」頁面
+    對應介面的「讀書統計」頁面
     就算使用者還沒有任何讀書紀錄也不會壞掉
 
     回傳：
@@ -330,7 +378,7 @@ def get_stats(user_id):
     """
     con = get_connection()
     try:
-        # 分開查詢避免 LEFT JOIN 在沒有 session 時回傳 NULL 造成錯誤
+        # 分開查詢，避免沒有 session 時回傳 NULL 造成錯誤
         user = con.sql("""
             SELECT total_hours, exp, affection
             FROM users
@@ -448,12 +496,11 @@ def add_label(user_id, name):
     """
     con = get_connection()
     try:
-        new_id = con.sql("SELECT COALESCE(MAX(id), 0) FROM labels").fetchone()[0] + 1
-
+        # 讓 Sequence 自動產生 id
         con.sql("""
-            INSERT INTO labels (id, user_id, name)
-            VALUES ($id, $user_id, $name)
-        """, params={'id': new_id, 'user_id': user_id, 'name': name})
+            INSERT INTO labels (user_id, name)
+            VALUES ($user_id, $name)
+        """, params={'user_id': user_id, 'name': name})
 
     finally:
         con.close()
