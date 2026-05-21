@@ -360,6 +360,27 @@ def update_story_progress(user_id, chapter, branch=None):
 # 【給介面／統計頁面用】
 # ==============================================================
 
+# 在 data_bridge.py 中新增註冊函式
+def register_user(username):
+    """
+    註冊新使用者
+    回傳: 成功則回傳新的 user_id，重複則回傳 None
+    """
+    con = get_connection()
+    try:
+        # 嘗試新增使用者，如果 username 重複，會拋出例外
+        con.sql("INSERT INTO users (username) VALUES ($name)", params={'name': username})
+        
+        # 成功後撈出剛剛產生的 id
+        user_id = con.sql("SELECT id FROM users WHERE username = $name", params={'name': username}).fetchone()[0]
+        return user_id
+    except Exception as e:
+        # 如果拋出錯誤，通常是因為違反 UNIQUE 限制（重複）
+        print(f"註冊失敗：名稱已存在或發生錯誤 - {e}")
+        return None
+    finally:
+        con.close()
+
 def get_stats(user_id):
     """
     讀取統計頁面需要的所有數據
