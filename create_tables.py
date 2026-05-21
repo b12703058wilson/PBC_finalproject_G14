@@ -22,7 +22,7 @@ con.sql("CREATE SEQUENCE IF NOT EXISTS seq_story_progress;")
 con.sql("""
     CREATE TABLE IF NOT EXISTS users (
         id              INTEGER PRIMARY KEY DEFAULT nextval('seq_users'),
-        username        TEXT,
+        username        TEXT UNIQUE,  -- 加上 UNIQUE 限制，確保不得重複
         exp             INTEGER   DEFAULT 0,    -- 累積經驗值
         affection       INTEGER   DEFAULT 0,    -- 好感度（0~100）
                                                 -- 待確認：好感度是否需要依故事線分開
