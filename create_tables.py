@@ -109,16 +109,6 @@ con.sql("""
 """)
 
 # ==============================
-# 新增預設使用者
-# ON CONFLICT DO NOTHING 代表已存在就不重複新增
-# ==============================
-con.sql("""
-    INSERT INTO users (id, username, exp, affection, total_hours)
-    VALUES (1, 'player', 0, 0, 0)
-    ON CONFLICT (id) DO NOTHING
-""")
-
-# ==============================
 # 新增預設標籤（測試用）
 # ==============================
 con.sql("""
