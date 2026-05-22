@@ -2,6 +2,21 @@
 # 新增：EXP 計算、好感度計算與衰減、日常劇情聊天頁面
 # 主線劇情改以 EXP 為解鎖門檻
 
+from data_bridge import (
+    register_user,
+    save_session as db_save_session,
+    update_exp_affection,
+    check_affection_decay,
+    get_stats,
+    get_recent_sessions,
+    get_story_progress,
+    update_story_progress
+)
+
+# 把開頭的改成這樣，import 整個模組
+import datetime
+from datetime import datetime as dt  # 用別名區分
+
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -18,7 +33,6 @@ import tkinter as tk
 import time
 import os
 import math
-import datetime
 from openpyxl import Workbook, load_workbook
 import matplotlib
 matplotlib.use("TkAgg")
@@ -283,6 +297,8 @@ class AppState:
     daily_aff_gained: float = 0
     last_study_date: str = ""
     today_chat_shown: bool = False
+    user_id: int = None          # ✅ 新增這行
+    session_start_dt: dt = None  # ✅ 新增這行，記錄開始時間的 datetime 格式
 
 
 # ════════════════════════════════════════════════
@@ -473,6 +489,7 @@ def start_timer(state: AppState):
     if not state.running:
         state.start_time = time.time() - state.elapsed_time
         state.running = True
+        state.session_start_dt = dt.now()  # ✅ 新增這行
 
 def do_pause(state: AppState, callbacks: dict,
              planned_secs: float = 0, distraction_count: int = 0):
@@ -497,6 +514,25 @@ def do_pause(state: AppState, callbacks: dict,
                  state.total_exp, state.daily_exp,
                  state.affection, state.daily_aff_gained,
                  state.last_study_date)
+    # ✅ 新增：存進資料庫
+    if state.user_id is not None and state.session_start_dt is not None:
+        end_dt = dt.now()
+        db_save_session(
+            user_id=state.user_id,
+            label_id=1,                    # 暫時寫死，之後接標籤選擇介面
+            mode='自訂',                    # 暫時寫死，之後接計時模式選擇
+            target_duration=int(planned_secs // 60),
+            start_time=state.session_start_dt,
+            end_time=end_dt,
+            total_distraction_count=distraction_count,
+            total_distraction_time=0       # 暫時寫死，之後接干擾功能
+        )
+        # ✅ 新增：更新 EXP 和好感度進資料庫
+        update_exp_affection(
+            user_id=state.user_id,
+            exp_delta=exp_gained,
+            affection_delta=aff_gained
+        )
     state.elapsed_time = 0
     if callbacks.get("on_pause"):
         callbacks["on_pause"](exp_gained, aff_gained)
@@ -579,6 +615,10 @@ def main():
     state.average_time     = saved["average_time"]
     state.user_name        = saved["user_name"]
     state.story_flags      = saved["story_flags"]
+    # ✅ 新增：同步資料庫的劇情進度
+    if state.user_id is not None:
+        progress = get_story_progress(state.user_id)
+        # 之後可以依 progress['chapter'] 來判斷哪些章節已解鎖
     state.total_exp        = saved["total_exp"]
     state.daily_exp        = saved["daily_exp"]
     state.affection        = saved["affection"]
@@ -586,7 +626,21 @@ def main():
     state.last_study_date  = saved["last_study_date"]
     state.today_chat_shown = saved["today_chat_shown"]
 
-    decay_amount = apply_daily_decay(state)
+    # ✅ 改用資料庫版本的好感度衰減
+    # 原本的 apply_daily_decay(state) 可以保留處理 daily_exp 重置
+    # 但好感度衰減改由資料庫處理
+    apply_daily_decay(state)  # 保留，處理 daily_exp 重置
+
+    if state.user_id is not None:
+        decayed = check_affection_decay(
+            user_id=state.user_id,
+            decay_threshold_hours=24,
+            decay_amount=5
+        )
+        # decayed 為 True 代表有衰減，原本顯示 toast 的邏輯不用改
+        decay_amount = 5 if decayed else 0
+    else:
+        decay_amount = 0
 
     root = tk.Tk()
     root.title("讀書計時器")
@@ -956,6 +1010,18 @@ def main():
                 return
             state.user_name = name
             save_user_name(state.game_data, name)
+            # ✅ 新增：向資料庫註冊使用者，取得 user_id
+            user_id = register_user(name)
+            if user_id is None:
+                # 如果名稱重複，代表是舊使用者，直接查詢 id
+                from data_bridge import get_connection
+                con = get_connection()
+                user_id = con.sql(
+                    "SELECT id FROM users WHERE username = $name",
+                    params={'name': name}
+                ).fetchone()[0]
+                con.close()
+            state.user_id = user_id
             if back_fn:
                 back_fn()
         tk.Button(input_frame, text="確認",
@@ -1004,10 +1070,37 @@ def main():
         total_str = f"{h_total}h {m_total:02d}m" if h_total else f"{m_total} 分"
         avg_m = int(state.average_time // 60)
         avg_s = int(state.average_time % 60)
-        sessions = load_session_history(state.game_data)
-        max_m = max((time_str_to_sec(t) for t in sessions), default=0) // 60
+        # ✅ 從資料庫拿統計數據
+        if state.user_id is not None:
+            stats = get_stats(state.user_id)
+            # 更新 state 確保數字一致
+            state.total_exp    = stats['exp']
+            state.affection    = stats['affection']
+            state.session_count = stats['session_count']
+
+            # 重新計算顯示用的時間字串
+            total_mins  = int(stats['total_hours'])
+            h_total     = total_mins // 60
+            m_total     = total_mins % 60
+            total_str   = f"{h_total}h {m_total:02d}m" if h_total else f"{m_total} 分"
+
+            avg_mins    = int(stats['avg_duration'])
+            avg_m    = avg_mins        # 直接用分鐘數
+            avg_s_val   = 0  # 資料庫存的是分鐘，沒有秒數
+            max_m       = int(stats['max_duration'])
+
+        else:
+            # 如果還沒有 user_id，用原本 Excel 的方式當備援
+            sessions = load_session_history(state.game_data)
+            max_m = max((time_str_to_sec(t) for t in sessions), default=0) // 60
+            h_total = int(state.total_time // 3600)
+            m_total = int((state.total_time % 3600) // 60)
+            total_str = f"{h_total}h {m_total:02d}m" if h_total else f"{m_total} 分"
+            avg_m = int(state.average_time // 60)
+            avg_s_val = int(state.average_time % 60)
+
         big_card(grid, 0, 0, "累積讀書時間", total_str)
-        big_card(grid, 0, 1, "平均每次時長", f"{avg_m}:{avg_s:02d}", "分鐘")
+        big_card(grid, 0, 1, "平均每次時長", f"{avg_m}:{avg_s_val:02d}", "分鐘")
         big_card(grid, 1, 0, "計時次數", str(state.session_count), "次")
         big_card(grid, 1, 1, "最長單次", str(max_m), "分鐘")
 
@@ -1045,15 +1138,20 @@ def main():
         fig, ax = plt.subplots(figsize=(4.5, 1.8), dpi=90)
         fig.patch.set_facecolor(C["surface"])
         ax.set_facecolor(C["surface"])
-        last5 = sessions[-5:] if sessions else []
-        if last5:
-            mins = [time_str_to_min(t) for t in last5]
-            x = range(1, len(mins) + 1)
-            ax.bar(x, mins,
-                   color=[C["pink"] if i == len(mins) - 1
-                          else C["pink_light"] for i in range(len(mins))],
-                   width=0.5, zorder=3)
-            ax.set_ylim(0, max(mins) * 1.3)
+        # ✅ 從資料庫拿最近5次
+        if state.user_id is not None:
+            df = get_recent_sessions(state.user_id, limit=5)
+            last5_mins = df['actual_duration'].tolist() if len(df) > 0 else []
+        else:
+            last5_mins = []
+
+        if last5_mins:
+            x = range(1, len(last5_mins) + 1)
+            ax.bar(x, last5_mins,
+                color=[C["pink"] if i == len(last5_mins) - 1
+                        else C["pink_light"] for i in range(len(last5_mins))],
+                width=0.5, zorder=3)
+            ax.set_ylim(0, max(last5_mins) * 1.3)
             ax.set_xticks(list(x))
             ax.set_xticklabels([str(i) for i in x], fontsize=9, color=C["text3"])
             ax.tick_params(axis="y", labelsize=9, labelcolor=C["text3"])
@@ -1067,7 +1165,8 @@ def main():
                     transform=ax.transAxes, color=C["text3"], fontsize=11)
             for spine in ax.spines.values():
                 spine.set_visible(False)
-            ax.set_xticks([]); ax.set_yticks([])
+            ax.set_xticks([])
+            ax.set_yticks([])
         fig.tight_layout(pad=0.8)
         canvas = FigureCanvasTkAgg(fig, master=chart_card)
         canvas.draw()
