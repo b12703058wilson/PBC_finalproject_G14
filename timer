@@ -1,1 +1,330 @@
+# 匯入時間相關模組
+from datetime import datetime
+import time
 
+
+class StudySession:
+    """
+    StudySession 用來管理一次完整的讀書流程
+    包含：
+    1. 計時
+    2. 暫停 / 繼續
+    3. 干擾紀錄
+    4. 完成判定
+    5. EXP 與好感度計算
+    """
+
+    def __init__(self, tag, target_minutes=25):
+        """
+        初始化讀書 session
+
+        Parameters
+        ----------
+        tag : str
+            讀書標籤，例如：
+            「微積分」、「英文」、「期中考複習」
+
+        target_minutes : int
+            預計讀書分鐘數
+        """
+
+        # 讀書標籤
+        self.tag = tag
+
+        # 目標讀書秒數
+        self.target_seconds = target_minutes * 60
+
+        # session 開始時間
+        self.start_time = None
+
+        # session 結束時間
+        self.end_time = None
+
+        # 實際讀書秒數
+        self.elapsed_seconds = 0
+
+        # 暫停開始時間
+        self.pause_start = None
+
+        # 累積暫停秒數
+        self.total_pause_seconds = 0
+
+        # 是否正在讀書
+        self.is_running = False
+
+        # 是否已完成 session
+        self.is_finished = False
+
+        # 干擾紀錄清單
+        # 每筆會長這樣：
+        # {
+        #     "reason": "滑手機",
+        #     "minutes": 5,
+        #     "time": "2026-05-24 18:00:00"
+        # }
+        self.distractions = []
+
+    def start(self):
+        """
+        開始讀書計時
+        """
+
+        # 紀錄開始時間
+        self.start_time = datetime.now()
+
+        # 更新狀態
+        self.is_running = True
+
+        print(f"開始讀書：{self.tag}")
+
+    def pause(self, reason):
+        """
+        暫停讀書
+
+        Parameters
+        ----------
+        reason : str
+            暫停原因
+        """
+
+        # 如果本來就沒在執行
+        if not self.is_running:
+            print("目前沒有正在計時")
+            return
+
+        # 紀錄暫停開始時間
+        self.pause_start = datetime.now()
+
+        # 更新狀態
+        self.is_running = False
+
+        print(f"暫停讀書，原因：{reason}")
+
+    def resume(self):
+        """
+        繼續讀書
+        """
+
+        # 如果沒有暫停紀錄
+        if self.pause_start is None:
+            print("目前沒有暫停紀錄")
+            return
+
+        # 計算這次暫停多久
+        pause_duration = datetime.now() - self.pause_start
+
+        # 加入累積暫停時間
+        self.total_pause_seconds += pause_duration.total_seconds()
+
+        # 清空暫停時間
+        self.pause_start = None
+
+        # 更新狀態
+        self.is_running = True
+
+        print("繼續讀書")
+
+    def add_distraction(self, reason, minutes):
+        """
+        新增干擾紀錄
+
+        Parameters
+        ----------
+        reason : str
+            干擾原因
+            例如：
+            滑手機、吃飯、聊天
+
+        minutes : int
+            被干擾幾分鐘
+        """
+
+        # 建立干擾資料
+        distraction = {
+            "reason": reason,
+            "minutes": minutes,
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+
+        # 加入干擾清單
+        self.distractions.append(distraction)
+
+        print(f"已記錄干擾：{reason}，{minutes} 分鐘")
+
+    def finish(self):
+        """
+        結束讀書 session
+        並回傳整理好的結果資料
+        """
+
+        # 記錄結束時間
+        self.end_time = datetime.now()
+
+        # 計算總經過時間
+        total_time = self.end_time - self.start_time
+
+        # 扣除暫停時間後
+        # 得到真正讀書秒數
+        self.elapsed_seconds = (
+            total_time.total_seconds()
+            - self.total_pause_seconds
+        )
+
+        # 更新狀態
+        self.is_running = False
+        self.is_finished = True
+
+        # 產生結果資料
+        result = self.generate_result()
+
+        return result
+
+    def generate_result(self):
+        """
+        整理本次讀書 session 的結果
+        """
+
+        # 將秒數轉換成分鐘
+        study_minutes = round(self.elapsed_seconds / 60, 2)
+
+        # 目標分鐘數
+        target_minutes = round(self.target_seconds / 60, 2)
+
+        # 計算總干擾時間
+        distraction_minutes = sum(
+            item["minutes"]
+            for item in self.distractions
+        )
+
+        # 完成率
+        # 最大不超過 1
+        completion_rate = min(
+            study_minutes / target_minutes,
+            1
+        )
+
+        # 是否達成目標
+        is_completed = (
+            study_minutes >= target_minutes
+        )
+
+        # 專注分數
+        # 每 1 分鐘干擾扣 5 分
+        focus_score = max(
+            0,
+            100 - distraction_minutes * 5
+        )
+
+        # 計算 EXP
+        exp = self.calculate_exp(
+            study_minutes,
+            completion_rate,
+            distraction_minutes
+        )
+
+        # 計算好感度變化
+        affection_change = self.calculate_affection_change(
+            is_completed,
+            distraction_minutes
+        )
+
+        # 回傳整理好的結果
+        return {
+            "tag": self.tag,
+            "start_time":
+                self.start_time.strftime("%Y-%m-%d %H:%M:%S"),
+
+            "end_time":
+                self.end_time.strftime("%Y-%m-%d %H:%M:%S"),
+
+            "target_minutes": target_minutes,
+
+            "study_minutes": study_minutes,
+
+            "distraction_minutes": distraction_minutes,
+
+            "distraction_count":
+                len(self.distractions),
+
+            "distractions":
+                self.distractions,
+
+            "completion_rate":
+                round(completion_rate, 2),
+
+            "is_completed":
+                is_completed,
+
+            "focus_score":
+                focus_score,
+
+            "exp_gain":
+                exp,
+
+            "affection_change":
+                affection_change
+        }
+
+    def calculate_exp(
+        self,
+        study_minutes,
+        completion_rate,
+        distraction_minutes
+    ):
+        """
+        計算經驗值 EXP
+        """
+
+        # 基礎 EXP
+        # 每分鐘給 2 EXP
+        base_exp = study_minutes * 2
+
+        # 完成獎勵
+        if completion_rate >= 1:
+            completion_bonus = 30
+        else:
+            completion_bonus = 0
+
+        # 干擾扣分
+        distraction_penalty = (
+            distraction_minutes * 3
+        )
+
+        # 最終 EXP
+        exp = (
+            base_exp
+            + completion_bonus
+            - distraction_penalty
+        )
+
+        # EXP 不可小於 0
+        return max(0, round(exp))
+
+    def calculate_affection_change(
+        self,
+        is_completed,
+        distraction_minutes
+    ):
+        """
+        計算好感度變化
+        """
+
+        change = 0
+
+        # 有完成目標
+        if is_completed:
+            change += 5
+
+        # 沒完成目標
+        else:
+            change -= 3
+
+        # 干擾太多
+        if distraction_minutes >= 10:
+            change -= 5
+
+        # 完全沒分心
+        elif distraction_minutes == 0:
+            change += 3
+
+        return change
