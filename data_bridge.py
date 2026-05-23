@@ -4,10 +4,73 @@ from datetime import datetime
 # ==============================
 # 建立資料庫連線的函式
 # 每次需要連線時呼叫，用完透過 finally 自動關閉
-# 避免多個連線同時存在造成衝突
 # ==============================
 def get_connection():
     return duckdb.connect('study_app.db')
+
+
+# ==============================================================
+# 【使用者註冊】
+# ==============================================================
+
+def register_user(username):
+    """
+    註冊新使用者
+    註冊成功後自動建立劇情進度
+
+    參數：
+        username : 使用者輸入的名字
+    回傳：
+        成功回傳新的 user_id，名稱重複回傳 None
+    """
+    con = get_connection()
+    try:
+        # 新增使用者，username 重複會拋出例外
+        con.sql(
+            "INSERT INTO users (username) VALUES ($name)",
+            params={'name': username}
+        )
+
+        # 撈回剛剛產生的 user_id
+        user_id = con.sql(
+            "SELECT id FROM users WHERE username = $name",
+            params={'name': username}
+        ).fetchone()[0]
+
+        # 自動幫新使用者建立預設劇情進度
+        con.sql("""
+            INSERT INTO story_progress (user_id, story_id, chapter, branch)
+            VALUES ($user_id, 1, 0, NULL)
+        """, params={'user_id': user_id})
+
+        return user_id
+
+    except Exception as e:
+        print(f"註冊失敗：名稱已存在或發生錯誤 - {e}")
+        return None
+    finally:
+        con.close()
+
+
+def get_user_id(username):
+    """
+    透過使用者名稱查詢 user_id
+    用於舊使用者重新登入時
+
+    參數：
+        username : 使用者名稱
+    回傳：
+        user_id（找不到回傳 None）
+    """
+    con = get_connection()
+    try:
+        result = con.sql(
+            "SELECT id FROM users WHERE username = $name",
+            params={'name': username}
+        ).fetchone()
+        return result[0] if result else None
+    finally:
+        con.close()
 
 
 # ==============================================================
@@ -22,23 +85,22 @@ def save_session(user_id, label_id, mode, target_duration,
     同時更新使用者的累積時數和上次讀書時間
 
     參數：
-        user_id                 : 使用者編號（目前固定傳 1）
+        user_id                 : 使用者編號
         label_id                : 讀書標籤編號（對應 labels.id）
         mode                    : 計時模式，傳 '番茄鐘' 或 '自訂'
-        target_duration         : 目標時長（分鐘），讓遊戲化組判斷是否達成
+        target_duration         : 目標時長（分鐘）
         start_time              : 開始時間（datetime 格式）
         end_time                : 結束時間（datetime 格式）
         total_distraction_count : 這次總共被干擾幾次
         total_distraction_time  : 這次總干擾時長（分鐘）
     回傳：
-        新增的 session id（之後存干擾紀錄時需要用到）
+        新增的 session id
     """
     con = get_connection()
     try:
         # 計算實際讀書時長（分鐘）
         actual_duration = int((end_time - start_time).total_seconds() / 60)
 
-        # 讓 Sequence 自動產生 id，不用手動計算
         con.sql("""
             INSERT INTO sessions (
                 user_id, label_id, mode, target_duration,
@@ -88,7 +150,6 @@ def save_session(user_id, label_id, mode, target_duration,
 def save_distraction(session_id, type_id, start_time, end_time, overtime_threshold=20):
     """
     讀書被打斷時，存一筆干擾紀錄進資料庫
-    自動判斷這次干擾是否超過門檻時間
 
     參數：
         session_id         : 對應哪次讀書（save_session 回傳的 id）
@@ -99,13 +160,9 @@ def save_distraction(session_id, type_id, start_time, end_time, overtime_thresho
     """
     con = get_connection()
     try:
-        # 計算干擾時長（分鐘）
-        duration = int((end_time - start_time).total_seconds() / 60)
-
-        # 判斷是否超過門檻
+        duration    = int((end_time - start_time).total_seconds() / 60)
         is_overtime = duration >= overtime_threshold
 
-        # 讓 Sequence 自動產生 id
         con.sql("""
             INSERT INTO distractions (
                 session_id, type_id,
@@ -133,17 +190,12 @@ def save_distraction(session_id, type_id, start_time, end_time, overtime_thresho
 def check_overtime_reminder(user_id):
     """
     讀書開始前呼叫，檢查上次是否有超時干擾還沒提醒過
-    如果有，回傳提醒資料並標記為已提醒
 
-    參數：
-        user_id : 使用者編號
     回傳：
-        需要提醒的干擾紀錄 DataFrame
-        （空的話代表不需要提醒）
+        需要提醒的干擾紀錄 DataFrame（空的話代表不需要提醒）
     """
     con = get_connection()
     try:
-        # 找出屬於這個使用者、超時且還沒提醒的干擾紀錄
         result = con.sql("""
             SELECT d.id, dt.name AS type_name, d.duration
             FROM distractions d
@@ -155,7 +207,6 @@ def check_overtime_reminder(user_id):
         """, params={'user_id': user_id}).df()
 
         if len(result) > 0:
-            # 標記為已提醒，下次開啟就不會再跳出來
             con.sql("""
                 UPDATE distractions
                 SET is_reminded = TRUE
@@ -209,15 +260,23 @@ def update_exp_affection(user_id, exp_delta, affection_delta):
     """
     con = get_connection()
     try:
+        # 先讀取目前的好感度
+        current = con.sql("""
+            SELECT affection FROM users WHERE id = $user_id
+        """, params={'user_id': user_id}).fetchone()[0]
+
+        # 用 Python 限制好感度在 0~100 之間
+        new_affection = max(0, min(100, current + affection_delta))
+
         con.sql("""
             UPDATE users
             SET exp       = exp + $exp_delta,
-                affection = MAX(0, MIN(100, affection + $affection_delta))
+                affection = $new_affection
             WHERE id = $user_id
         """, params={
-            'exp_delta'      : exp_delta,
-            'affection_delta': affection_delta,
-            'user_id'        : user_id
+            'exp_delta'    : exp_delta,
+            'new_affection': new_affection,
+            'user_id'      : user_id
         })
 
     finally:
@@ -226,17 +285,11 @@ def update_exp_affection(user_id, exp_delta, affection_delta):
 
 def check_affection_decay(user_id, decay_threshold_hours=24, decay_amount=5):
     """
-    檢查使用者是否太久沒讀書
-    超過門檻就自動扣好感度
+    檢查使用者是否太久沒讀書，超過門檻就自動扣好感度
     建議每次開啟 App 時呼叫
 
-    參數：
-        user_id               : 使用者編號
-        decay_threshold_hours : 幾小時沒讀書才衰減，預設 24 小時
-        decay_amount          : 每次衰減多少好感度，預設扣 5
     回傳：
-        True  代表有衰減（可以用來觸發責備對話）
-        False 代表不需要衰減
+        True 代表有衰減，False 代表不需要衰減
     """
     con = get_connection()
     try:
@@ -248,15 +301,13 @@ def check_affection_decay(user_id, decay_threshold_hours=24, decay_amount=5):
 
         last_study_time = result[0]
 
-        # 如果從來沒讀過書，不衰減
+        # 從來沒讀過書，不衰減
         if last_study_time is None:
             return False
 
-        # 計算距離上次讀書過了幾小時
         hours_passed = (datetime.now() - last_study_time).total_seconds() / 3600
 
         if hours_passed >= decay_threshold_hours:
-            # 超過門檻，呼叫 update_exp_affection 扣好感度
             update_exp_affection(user_id, exp_delta=0, affection_delta=-decay_amount)
             return True
 
@@ -278,8 +329,9 @@ def get_last_session_result(user_id):
             'mode'                   : 計時模式,
             'total_distraction_count': 干擾次數,
             'total_distraction_time' : 總干擾時長（分鐘）,
-            'is_completed'           : 是否達成目標（actual >= target）
+            'is_completed'           : 是否達成目標
         }
+        沒有紀錄回傳 None
     """
     con = get_connection()
     try:
@@ -292,7 +344,6 @@ def get_last_session_result(user_id):
             LIMIT 1
         """, params={'user_id': user_id}).fetchone()
 
-        # 如果完全沒有讀書紀錄，回傳 None
         if result is None:
             return None
 
@@ -302,7 +353,6 @@ def get_last_session_result(user_id):
             'mode'                   : result[2],
             'total_distraction_count': result[3],
             'total_distraction_time' : result[4],
-            # 實際時長 >= 目標時長 就算達成
             'is_completed'           : result[0] >= result[1]
         }
 
@@ -360,32 +410,9 @@ def update_story_progress(user_id, chapter, branch=None):
 # 【給介面／統計頁面用】
 # ==============================================================
 
-# 在 data_bridge.py 中新增註冊函式
-def register_user(username):
-    """
-    註冊新使用者
-    回傳: 成功則回傳新的 user_id，重複則回傳 None
-    """
-    con = get_connection()
-    try:
-        # 嘗試新增使用者，如果 username 重複，會拋出例外
-        con.sql("INSERT INTO users (username) VALUES ($name)", params={'name': username})
-        
-        # 成功後撈出剛剛產生的 id
-        user_id = con.sql("SELECT id FROM users WHERE username = $name", params={'name': username}).fetchone()[0]
-        return user_id
-    except Exception as e:
-        # 如果拋出錯誤，通常是因為違反 UNIQUE 限制（重複）
-        print(f"註冊失敗：名稱已存在或發生錯誤 - {e}")
-        return None
-    finally:
-        con.close()
-
 def get_stats(user_id):
     """
     讀取統計頁面需要的所有數據
-    對應介面的「讀書統計」頁面
-    就算使用者還沒有任何讀書紀錄也不會壞掉
 
     回傳：
         {
@@ -399,7 +426,6 @@ def get_stats(user_id):
     """
     con = get_connection()
     try:
-        # 分開查詢，避免沒有 session 時回傳 NULL 造成錯誤
         user = con.sql("""
             SELECT total_hours, exp, affection
             FROM users
@@ -430,11 +456,8 @@ def get_stats(user_id):
 
 def get_recent_sessions(user_id, limit=5):
     """
-    讀取最近幾次讀書時長
-    用來畫統計頁面的長條圖
+    讀取最近幾次讀書時長，用來畫長條圖
 
-    參數：
-        limit : 要取幾筆，預設最近 5 次
     回傳：
         DataFrame，包含 start_time 和 actual_duration 兩個欄位
     """
@@ -454,8 +477,7 @@ def get_recent_sessions(user_id, limit=5):
 
 def get_label_summary(user_id):
     """
-    統計每個標籤的總讀書時間
-    用來畫各科目讀書時間分布圖
+    統計每個標籤的總讀書時間，用來畫圓餅圖或長條圖
 
     回傳：
         DataFrame，包含 label_name 和 total_duration 兩個欄位
@@ -479,8 +501,7 @@ def get_label_summary(user_id):
 
 def get_distraction_summary(user_id):
     """
-    統計每種干擾類型的次數和總時長
-    用來畫「時間流失清單」圖表
+    統計每種干擾類型的次數和總時長，用來畫時間流失清單圖表
 
     回傳：
         DataFrame，包含 type_name、count、total_duration 三個欄位
@@ -517,7 +538,6 @@ def add_label(user_id, name):
     """
     con = get_connection()
     try:
-        # 讓 Sequence 自動產生 id
         con.sql("""
             INSERT INTO labels (user_id, name)
             VALUES ($user_id, $name)
@@ -529,8 +549,7 @@ def add_label(user_id, name):
 
 def get_labels(user_id):
     """
-    讀取使用者所有的標籤清單
-    用來顯示下拉選單
+    讀取使用者所有的標籤清單，用來顯示下拉選單
 
     回傳：
         DataFrame，包含 id 和 name 兩個欄位
@@ -550,8 +569,7 @@ def get_labels(user_id):
 
 def get_distraction_types():
     """
-    讀取所有干擾類型選項
-    用來顯示干擾選擇的下拉選單
+    讀取所有干擾類型選項，用來顯示下拉選單
 
     回傳：
         DataFrame，包含 id 和 name 兩個欄位
