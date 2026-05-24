@@ -1,5 +1,5 @@
 import duckdb
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ==============================
 # 建立資料庫連線的函式
@@ -410,105 +410,94 @@ def update_story_progress(user_id, chapter, branch=None):
 # 【給介面／統計頁面用】
 # ==============================================================
 
-def get_stats(user_id):
+def get_dashboard_stats(user_id, days):
     """
-    讀取統計頁面需要的所有數據
+    讀取統計儀表板需要的所有數據
+    支援動態天數切換（例如傳 7 代表過去7天，傳 30 代表過去30天）
+
+    參數：
+        user_id : 使用者編號
+        days    : 要查詢過去幾天的資料
 
     回傳：
         {
-            'total_hours'  : 累積讀書時數（分鐘）,
-            'session_count': 計時次數,
-            'avg_duration' : 平均每次時長（分鐘）,
-            'max_duration' : 最長一次時長（分鐘）,
-            'exp'          : 累積經驗值,
-            'affection'    : 好感度
+            "core_stats": {
+                "total_hours"            : 累積讀書總時數（分鐘，不受天數限制）,
+                "exp"                    : 累積經驗值（不受天數限制）,
+                "affection"              : 好感度（不受天數限制）,
+                "session_count"          : 該時間範圍內的計時次數,
+                "avg_duration"           : 該時間範圍內的平均每次時長（分鐘）,
+                "max_duration"           : 該時間範圍內的最長一次（分鐘）,
+                "perfect_sessions"       : 該時間範圍內的完美專注次數（零干擾）,
+                "total_distraction_count": 該時間範圍內的總干擾次數
+            },
+            "pie_chart"        : 各標籤讀書時間分布（含已刪除標籤的保護）,
+            "bar_chart"        : 每日讀書趨勢,
+            "distraction_chart": 干擾類型統計（時間流失清單）
         }
     """
     con = get_connection()
     try:
-        user = con.sql("""
+        # 確保 days 是合法的正整數，防止傳入奇怪的值
+        days = max(1, int(days))
+
+        # 計算截止日期
+        cutoff_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+
+        # ① 核心數據（total_hours、exp、affection 不受天數限制，反映總累積）
+        user_info = con.sql("""
             SELECT total_hours, exp, affection
             FROM users
             WHERE id = $user_id
         """, params={'user_id': user_id}).fetchone()
 
-        sessions = con.sql("""
+        # ② session 統計（受天數限制，反映該時間範圍內的表現）
+        # 一次查詢同時拿到所有需要的數據，效率較好
+        sessions_stats = con.sql("""
             SELECT
-                COUNT(id)            AS session_count,
-                AVG(actual_duration) AS avg_duration,
-                MAX(actual_duration) AS max_duration
+                COUNT(id)                               AS session_count,
+                AVG(actual_duration)                    AS avg_duration,
+                MAX(actual_duration)                    AS max_duration,
+                SUM(CASE WHEN total_distraction_count = 0
+                         THEN 1 ELSE 0 END)             AS perfect_sessions,
+                SUM(total_distraction_count)            AS total_distraction_count
             FROM sessions
-            WHERE user_id = $user_id
-        """, params={'user_id': user_id}).fetchone()
+            WHERE user_id   = $user_id
+              AND start_time >= CAST($cutoff_date AS TIMESTAMP)
+        """, params={'user_id': user_id, 'cutoff_date': cutoff_date}).fetchone()
 
-        return {
-            'total_hours'  : user[0],
-            'exp'          : user[1],
-            'affection'    : user[2],
-            'session_count': sessions[0] or 0,
-            'avg_duration' : round(sessions[1], 1) if sessions[1] else 0,
-            'max_duration' : sessions[2] or 0
-        }
-
-    finally:
-        con.close()
-
-
-def get_recent_sessions(user_id, limit=5):
-    """
-    讀取最近幾次讀書時長，用來畫長條圖
-
-    回傳：
-        DataFrame，包含 start_time 和 actual_duration 兩個欄位
-    """
-    con = get_connection()
-    try:
-        return con.sql("""
-            SELECT start_time, actual_duration
-            FROM sessions
-            WHERE user_id = $user_id
-            ORDER BY start_time DESC
-            LIMIT $limit
-        """, params={'user_id': user_id, 'limit': limit}).df()
-
-    finally:
-        con.close()
-
-
-def get_label_summary(user_id):
-    """
-    統計每個標籤的總讀書時間，用來畫圓餅圖或長條圖
-
-    回傳：
-        DataFrame，包含 label_name 和 total_duration 兩個欄位
-    """
-    con = get_connection()
-    try:
-        return con.sql("""
+        # ③ 圓餅圖：各標籤讀書時間分布
+        # 用 LEFT JOIN 加 COALESCE 保護被刪除的標籤，不會因為標籤被刪就遺失歷史資料
+        pie_data = con.sql("""
             SELECT
-                l.name                 AS label_name,
-                SUM(s.actual_duration) AS total_duration
+                COALESCE(l.name, '已刪除/未分類') AS label_name,
+                SUM(s.actual_duration)            AS total_minutes
             FROM sessions s
-            JOIN labels l ON s.label_id = l.id
-            WHERE s.user_id = $user_id
-            GROUP BY l.name
-            ORDER BY total_duration DESC
-        """, params={'user_id': user_id}).df()
+            LEFT JOIN labels l ON s.label_id = l.id
+            WHERE s.user_id    = $user_id
+              AND s.start_time >= CAST($cutoff_date AS TIMESTAMP)
+            GROUP BY label_name
+            ORDER BY total_minutes DESC
+        """, params={'user_id': user_id, 'cutoff_date': cutoff_date}).df()
 
-    finally:
-        con.close()
+        # ④ 長條圖：每日讀書趨勢
+        bar_data = con.sql("""
+            SELECT
+                CAST(start_time AS DATE) AS study_date,
+                SUM(actual_duration)     AS daily_minutes
+            FROM sessions
+            WHERE user_id    = $user_id
+              AND start_time >= CAST($cutoff_date AS TIMESTAMP)
+            GROUP BY CAST(start_time AS DATE)
+            ORDER BY study_date ASC
+        """, params={'user_id': user_id, 'cutoff_date': cutoff_date}).df()
 
+        # 把日期轉成字串，方便介面組直接使用
+        if not bar_data.empty:
+            bar_data['study_date'] = bar_data['study_date'].astype(str)
 
-def get_distraction_summary(user_id):
-    """
-    統計每種干擾類型的次數和總時長，用來畫時間流失清單圖表
-
-    回傳：
-        DataFrame，包含 type_name、count、total_duration 三個欄位
-    """
-    con = get_connection()
-    try:
-        return con.sql("""
+        # ⑤ 干擾統計：時間流失清單
+        distraction_data = con.sql("""
             SELECT
                 dt.name         AS type_name,
                 COUNT(d.id)     AS count,
@@ -516,10 +505,29 @@ def get_distraction_summary(user_id):
             FROM distractions d
             JOIN distraction_types dt ON d.type_id    = dt.id
             JOIN sessions          s  ON d.session_id = s.id
-            WHERE s.user_id = $user_id
+            WHERE s.user_id    = $user_id
+              AND s.start_time >= CAST($cutoff_date AS TIMESTAMP)
             GROUP BY dt.name
             ORDER BY total_duration DESC
-        """, params={'user_id': user_id}).df()
+        """, params={'user_id': user_id, 'cutoff_date': cutoff_date}).df()
+
+        return {
+            "core_stats": {
+                # 總累積數據（不受天數限制）
+                "total_hours"            : user_info[0] if user_info else 0,
+                "exp"                    : user_info[1] if user_info else 0,
+                "affection"              : user_info[2] if user_info else 0,
+                # 時間範圍內的表現數據
+                "session_count"          : sessions_stats[0] or 0,
+                "avg_duration"           : round(sessions_stats[1], 1) if sessions_stats[1] else 0,
+                "max_duration"           : sessions_stats[2] or 0,
+                "perfect_sessions"       : sessions_stats[3] or 0,
+                "total_distraction_count": sessions_stats[4] or 0
+            },
+            "pie_chart"        : pie_data.to_dict(orient='records'),
+            "bar_chart"        : bar_data.to_dict(orient='records'),
+            "distraction_chart": distraction_data.to_dict(orient='records')
+        }
 
     finally:
         con.close()
@@ -546,6 +554,28 @@ def add_label(user_id, name):
     finally:
         con.close()
 
+def delete_label(user_id, label_id):
+    """
+    刪除指定的讀書標籤
+    為了保留過去的讀書總時數，會先將歷史紀錄的標籤設為 NULL (未分類) 後再刪除標籤
+    """
+    con = get_connection()
+    try:
+        # 步驟一：保護歷史紀錄！將過去用到這個標籤的 session，標籤清空為 NULL
+        con.sql("""
+            UPDATE sessions 
+            SET label_id = NULL 
+            WHERE user_id = $user_id AND label_id = $label_id
+        """, params={'user_id': user_id, 'label_id': label_id})
+
+        # 步驟二：放心地把標籤從清單中刪除
+        con.sql("""
+            DELETE FROM labels 
+            WHERE user_id = $user_id AND id = $label_id
+        """, params={'user_id': user_id, 'label_id': label_id})
+
+    finally:
+        con.close()
 
 def get_labels(user_id):
     """
