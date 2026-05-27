@@ -1,19 +1,29 @@
 import duckdb
 from datetime import datetime, timedelta
-
+import os
 
 # ==============================
 # 建立資料庫連線的函式
 # 每次需要連線時呼叫，用完透過 finally 自動關閉
 # ==============================
 def get_connection():
-    return duckdb.connect('study_app.db')
+    # 1. 取得這支 .py 檔案所在的資料夾路徑
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # 2. 強制把 study_app.db 釘在這個資料夾裡面
+    db_path = os.path.join(base_dir, 'study_app.db')
+    
+    # 3. 用這個絕對路徑去連線
+    return duckdb.connect(db_path)
 
 def init_db():
     # ==============================
     # 建立資料庫連線
     # ==============================
-    con = duckdb.connect('study_app.db')
+    # 同樣的，init_db 也要改用絕對路徑，確保它在正確的地方建立檔案
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    db_path = os.path.join(base_dir, 'study_app.db')
+    con = duckdb.connect(db_path)
 
     # ==============================
     # 建立 Sequences（自動跳號產生器）
@@ -24,6 +34,7 @@ def init_db():
     con.sql("CREATE SEQUENCE IF NOT EXISTS seq_sessions START 1;")
     con.sql("CREATE SEQUENCE IF NOT EXISTS seq_distractions START 1;")
     con.sql("CREATE SEQUENCE IF NOT EXISTS seq_story_progress START 1;")
+    con.sql("CREATE SEQUENCE IF NOT EXISTS seq_story_flags START 1;")
 
     # ==============================
     # 建立 users 資料表
@@ -36,7 +47,9 @@ def init_db():
             affection       INTEGER   DEFAULT 0,   -- 好感度（0~100）
             total_hours     FLOAT     DEFAULT 0,   -- 累積讀書總時數（分鐘）
             last_session_id INTEGER   DEFAULT NULL,-- 最近一次讀書紀錄的 id
-            last_study_time TIMESTAMP DEFAULT NULL -- 上次讀書時間，用來判斷好感度是否衰減
+            last_study_time TIMESTAMP DEFAULT NULL, -- 上次讀書時間，用來判斷好感度是否衰減
+            story_route       TEXT      DEFAULT '',    -- ← 新增
+            today_chat_shown  BOOLEAN   DEFAULT FALSE  -- ← 新增
         )
     """)
 
@@ -106,6 +119,18 @@ def init_db():
             story_id INTEGER,             -- 故事線編號（例如 1=乙女、2=恐怖）
             chapter  INTEGER DEFAULT 0,   -- 目前解鎖到第幾章
             branch   TEXT    DEFAULT NULL -- 目前所在的分歧路線
+        )
+    """)
+
+    # ==============================
+    # 建立 story_flags 資料表
+    # ==============================
+    con.sql("""
+        CREATE TABLE IF NOT EXISTS story_flags (
+            id       INTEGER PRIMARY KEY DEFAULT nextval('seq_story_flags'),
+            user_id  INTEGER,
+            story_id TEXT,     -- 對應劇情的 id 字串，例如 'romance_ch1'
+            seen     BOOLEAN DEFAULT FALSE
         )
     """)
 
@@ -522,6 +547,144 @@ def update_story_progress(user_id, chapter, branch=None):
     finally:
         con.close()
 
+
+def save_story_route_db(user_id, route):
+    """儲存使用者選擇的故事線"""
+    con = get_connection()
+    try:
+        con.sql("""
+            UPDATE users SET story_route = $route WHERE id = $user_id
+        """, params={'route': route, 'user_id': user_id})
+    finally:
+        con.close()
+
+
+def save_today_chat_shown_db(user_id, value: bool):
+    """儲存今日日常是否已顯示"""
+    con = get_connection()
+    try:
+        con.sql("""
+            UPDATE users SET today_chat_shown = $value WHERE id = $user_id
+        """, params={'value': value, 'user_id': user_id})
+    finally:
+        con.close()
+
+
+def get_user_profile(user_id):
+    """
+    讀取使用者完整資料，給介面組初始化用
+    回傳 dict 或 None
+    """
+    con = get_connection()
+    try:
+        result = con.sql("""
+            SELECT exp, affection, total_hours,
+                   last_study_time, story_route, today_chat_shown
+            FROM users WHERE id = $user_id
+        """, params={'user_id': user_id}).fetchone()
+        if result is None:
+            return None
+        return {
+            'exp'             : result[0],
+            'affection'       : result[1],
+            'total_hours'     : result[2],   # 分鐘
+            'last_study_time' : result[3],
+            'story_route'     : result[4] or '',
+            'today_chat_shown': bool(result[5])
+        }
+    finally:
+        con.close()
+
+
+def save_story_flag_db(user_id, story_id, value: bool):
+    """
+    記錄某段劇情是否已看過
+    若該筆紀錄不存在就新增，存在就更新
+    """
+    con = get_connection()
+    try:
+        existing = con.sql("""
+            SELECT id FROM story_flags
+            WHERE user_id = $user_id AND story_id = $story_id
+        """, params={'user_id': user_id, 'story_id': story_id}).fetchone()
+
+        if existing:
+            con.sql("""
+                UPDATE story_flags SET seen = $value
+                WHERE user_id = $user_id AND story_id = $story_id
+            """, params={'value': value, 'user_id': user_id, 'story_id': story_id})
+        else:
+            con.sql("""
+                INSERT INTO story_flags (user_id, story_id, seen)
+                VALUES ($user_id, $story_id, $value)
+            """, params={'user_id': user_id, 'story_id': story_id, 'value': value})
+    finally:
+        con.close()
+
+
+def load_story_flags_db(user_id, all_story_ids: list) -> dict:
+    """
+    讀取使用者所有劇情旗標
+    回傳 {story_id: bool} 的 dict
+    """
+    con = get_connection()
+    try:
+        rows = con.sql("""
+            SELECT story_id, seen FROM story_flags
+            WHERE user_id = $user_id
+        """, params={'user_id': user_id}).fetchall()
+
+        # 先把所有旗標預設為 False
+        flags = {sid: False for sid in all_story_ids}
+        # 再把資料庫有紀錄的覆蓋進去
+        for story_id, seen in rows:
+            if story_id in flags:
+                flags[story_id] = bool(seen)
+        return flags
+    finally:
+        con.close()
+
+
+def get_session_stats_db(user_id):
+    """
+    給介面組讀取 session_count、total_hours、avg_duration 用
+    """
+    con = get_connection()
+    try:
+        result = con.sql("""
+            SELECT COUNT(id), AVG(actual_duration), MAX(actual_duration)
+            FROM sessions WHERE user_id = $user_id
+        """, params={'user_id': user_id}).fetchone()
+        total_hours = con.sql("""
+            SELECT total_hours FROM users WHERE id = $user_id
+        """, params={'user_id': user_id}).fetchone()
+        return {
+            'session_count': result[0] or 0,
+            'avg_duration' : result[1] or 0,   # 分鐘
+            'max_duration' : result[2] or 0,
+            'total_hours'  : total_hours[0] if total_hours else 0  # 分鐘
+        }
+    finally:
+        con.close()
+
+
+def get_recent_sessions_db(user_id, n=5):
+    """
+    讀取最近 n 筆讀書時長（分鐘），給統計頁的長條圖用
+    回傳 list of int
+    """
+    con = get_connection()
+    try:
+        rows = con.sql("""
+            SELECT actual_duration FROM sessions
+            WHERE user_id = $user_id
+            ORDER BY end_time DESC
+            LIMIT $n
+        """, params={'user_id': user_id, 'n': n}).fetchall()
+        # 反轉讓最新的在右邊
+        return [r[0] for r in reversed(rows)]
+    finally:
+        con.close()
 
 # ==============================================================
 # 【給介面／統計頁面用】
