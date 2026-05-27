@@ -6,7 +6,17 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 
-required_packages = ["openpyxl", "matplotlib"]
+from tables_and_databridge import (
+    init_db, get_user_id, register_user,
+    save_session as db_save_session,
+    update_exp_affection, get_exp_affection,
+    check_affection_decay, get_dashboard_stats,
+    get_user_profile, save_story_route_db,
+    save_today_chat_shown_db, save_story_flag_db,
+    load_story_flags_db, get_session_stats_db,
+    get_recent_sessions_db
+)
+required_packages = ["matplotlib"]
 for package in required_packages:
     try:
         __import__(package)
@@ -20,7 +30,6 @@ import os
 import math
 import datetime
 import random
-from openpyxl import Workbook, load_workbook
 import matplotlib
 matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
@@ -682,21 +691,6 @@ def get_active_stories(state) -> list:
     # 回傳[]是為了避免開局玩家還沒選擇路線時程式崩潰
     return STORIES.get(state.story_route, [])
 
-def get_all_story_cells() -> list:
-    """回傳所有章節（含所有路線）用到的 excel_cell，供 init_excel 初始化用。"""
-    # 儲存是否有看過序章的excel儲存格
-    cells = [STORY_PROLOGUE["excel_cell"]]
-    # 跑遍STORIES中的所有路線
-    for route_stories in STORIES.values():
-        # 把每個路線儲存劇情紀錄的儲存格找出來
-        for s in route_stories:
-            cells.append(s["excel_cell"])
-            # 如果有支線劇情，就把據路是否有看過支線劇情的儲存格也找出來
-            for b in s.get("branches", []):
-                if b.get("branch_cell"):
-                    cells.append(b["branch_cell"])
-    return cells
-
 
 # ════════════════════════════════════════════════
 #  分歧劇情選擇
@@ -806,7 +800,8 @@ class AppState:
     running: bool = False
     session_count: int = 0
     user_name: str = ""
-    game_data: str = "study_time.xlsx"
+    user_id: int = None                          # ← 新增
+    session_start_dt: object = None              # ← 新增
     story_flags: dict = field(default_factory=dict)
     total_exp: float = 0
     daily_exp: float = 0
@@ -844,204 +839,6 @@ def time_str_to_min(ts):
 # 取得今日時間的字串
 def today_str():
     return datetime.date.today().strftime("%Y-%m-%d")
-
-
-# ════════════════════════════════════════════════
-#  Excel 存取函式
-# ════════════════════════════════════════════════
-
-# 初次登入時建立保存遊戲資料的excel表
-def init_excel(game_data):
-    if not os.path.exists(game_data):
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "紀錄"
-        ws["A1"] = "總時間";        ws["B1"] = "單次讀書時間"
-        ws["C1"] = "計時次數";      ws["C3"] = "平均讀書時間"
-        ws["D1"] = "累積EXP";       ws["D2"] = 0
-        ws["E1"] = "今日EXP";       ws["E2"] = 0
-        ws["F1"] = "好感度";        ws["F2"] = 0
-        ws["G1"] = "今日好感度增量"; ws["G2"] = 0
-        ws["H1"] = "劇情旗標"
-        ws["I1"] = "使用者名稱"
-        ws["J1"] = "上次讀書日期";  ws["J2"] = ""
-        ws["K1"] = "今日日常已顯示"; ws["K2"] = False
-        ws["L1"] = "故事線";        ws["L2"] = ""
-        for cell in get_all_story_cells():
-            ws[cell] = False
-        wb.save(game_data)
-
-# 讀檔/存檔初始化系統
-def load_excel_data(game_data):
-    wb = load_workbook(game_data)
-    ws = wb["紀錄"]
-
-    # 收集所有可能的章節 id（含所有路線）供 story_flags 初始化
-    all_story_ids = [STORY_PROLOGUE["id"]]
-    # 找出STORIES中的所有路線
-    for route_stories in STORIES.values():
-        # 找出路線中的所有劇情
-        for s in route_stories:
-            # 把每個劇情的id找出來
-            all_story_ids.append(s["id"])
-            # 有分支的話就把分支的劇情id也找出來
-            for b in s.get("branches", []):
-                all_story_ids.append(b["id"])
-
-    # 遊戲初始化設定
-    result = {
-        "total_time": 0, "session_count": 0, "average_time": 0,
-        "user_name": "", "story_route": "",
-        # 把劇情id轉成以下結構："story_flags": {"id_01": False, "id_02":False, ...}
-        "story_flags": {sid: False for sid in all_story_ids},
-        "total_exp": 0, "daily_exp": 0, "affection": 0,
-        "daily_aff_gained": 0, "last_study_date": "", "today_chat_shown": False,
-    }
-
-    # 如果讀書總時間和總計時次數的儲存格已有數值，就載入total_time和session_count的紀錄
-    if ws["A2"].value is not None and ws["C2"].value is not None:
-        result["total_time"]    = time_str_to_sec(ws["A2"].value)
-        result["session_count"] = int(ws["C2"].value)
-        # 如果平均讀書時間已有數值，就載入average_time的紀錄
-        if ws["C4"].value is not None:
-            result["average_time"] = time_str_to_sec(ws["C4"].value)
-
-    # 讀取所有章節旗標（含序章、所有路線章節、支線旗標）
-    flag_map = {STORY_PROLOGUE["excel_cell"]: STORY_PROLOGUE["id"]}
-    for route_stories in STORIES.values():
-        for s in route_stories:
-            # 找出每一段劇情觀看紀錄儲存的位置
-            # flag_map的結果會長得像這樣：{H3:"id_01", H4:"id_02", ...}
-            flag_map[s["excel_cell"]] = s["id"]
-            for b in s.get("branches", []):
-                if b.get("branch_cell"):
-                    # 找出分支劇情觀看紀錄儲存的位置
-                    flag_map[b["branch_cell"]] = b["id"]
-    for cell, sid in flag_map.items():
-        # 讀取excel，找到儲存劇情紀錄的格子中的數值
-        val = ws[cell].value
-        # 如果格子裡有數值代表玩家看過該段劇情，result["story_flags"][sid]改成True，反之改成False
-        result["story_flags"][sid] = bool(val) if val is not None else False
-
-    # 讀取使用者名稱
-    if ws["I2"].value is not None:
-        result["user_name"] = ws["I2"].value
-
-    # 讀取其他資料
-    # 先列出每個資料存放的位置，以及資料的type
-    # 資料型態、名稱和儲存位置基本上不會更動，所以用tuple包起來
-    for cell, key, cast in [
-        ("D2", "total_exp",        float),
-        ("E2", "daily_exp",        float),
-        ("F2", "affection",        float),
-        ("G2", "daily_aff_gained", float),
-        ("J2", "last_study_date",  str),
-        ("K2", "today_chat_shown", bool),
-        ("L2", "story_route",      str),
-    ]:
-        # 讀取資料並傳入result中
-        val = ws[cell].value
-        if val is not None:
-            result[key] = cast(val) if cast != bool else bool(val)
-
-    return result
-
-
-# 儲存/更新遊戲紀錄(每次計時結束後使用)
-def save_session(game_data, total_time, elapsed_time, session_count,
-                 average_time, total_exp, daily_exp, affection,
-                 daily_aff_gained, last_study_date):
-    wb = load_workbook(game_data)
-    ws = wb["紀錄"]
-    # row的初始值設定為2(第一筆單次讀書紀錄在B2)
-    row = 2
-    # 第B欄是用來記錄單次讀書時間的，每次都要往下一格紀錄
-    # 從B2開始往下找，如果欄位已有紀錄就往下一格，直到找到沒有紀錄的欄位為止
-    while ws[f"B{row}"].value is not None:
-        row += 1
-    ws["A2"] = fmt(total_time);          ws[f"B{row}"] = fmt(elapsed_time)
-    ws["C2"] = session_count;            ws["C4"] = fmt(average_time)
-    ws["D2"] = round(total_exp, 2);      ws["E2"] = round(daily_exp, 2)
-    ws["F2"] = round(affection, 2);      ws["G2"] = round(daily_aff_gained, 2)
-    ws["J2"] = last_study_date
-    wb.save(game_data)
-
-
-# 讀完劇情後記錄的函式
-def save_story_flag(game_data, cell, value):
-    wb = load_workbook(game_data)
-    ws = wb["紀錄"]
-    ws[cell] = value
-    wb.save(game_data)
-
-
-# 儲存使用者名稱的函式
-def save_user_name(game_data, name):
-    wb = load_workbook(game_data)
-    ws = wb["紀錄"]
-    ws["I2"] = name
-    wb.save(game_data)
-
-
-# 儲存劇情路線的函式
-def save_story_route(game_data, route):
-    wb = load_workbook(game_data)
-    ws = wb["紀錄"]
-    ws["L2"] = route
-    wb.save(game_data)
-
-
-# 儲存是否觸發每式劇情的函式
-def save_today_chat_shown(game_data):
-    wb = load_workbook(game_data)
-    ws = wb["紀錄"]
-    ws["K2"] = True
-    wb.save(game_data)
-
-
-# 載入之前每次讀書紀錄
-def load_session_history(game_data):
-    wb = load_workbook(game_data)
-    ws = wb["紀錄"]
-    # 先建一個空list
-    sessions = []
-    # 從第2列開始記錄(單次讀書時間從B2開始記錄)
-    row = 2
-    # 只要該儲存格有數值，就append到session中
-    while ws[f"B{row}"].value is not None:
-        sessions.append(ws[f"B{row}"].value)
-        # apeend後把row+1去找下一個欄位
-        row += 1
-    return sessions
-
-
-# ════════════════════════════════════════════════
-#  好感度衰減
-# ════════════════════════════════════════════════
-
-def apply_daily_decay(state):
-    # 取得今天的日期字串
-    today = today_str()
-    # 更新每日經驗值、好感度以及日常劇情
-    if state.last_study_date != today:
-        state.daily_exp = 0
-        state.daily_aff_gained = 0
-        state.today_chat_shown = False
-    # 如果沒有last_study_date(新帳號)或是使用者今天已經登入了(last_study_date == today)就不需要扣好感度
-    if not state.last_study_date or state.last_study_date == today:
-        return 0.0
-    # 把上次上線的日期字串轉回成可以計算的日期物件
-    last = datetime.date.fromisoformat(state.last_study_date)
-    # 計算缺席的天數
-    days_absent = (datetime.date.today() - last).days - 1
-    # 沒有缺席就不扣好感度
-    if days_absent <= 0:
-        return 0.0
-    # 有缺席就使用calc_affection_decay計算要扣的好感度
-    decay = calc_affection_decay(days_absent)
-    # 扣除好感度
-    state.affection = max(AFF_MIN, state.affection - decay)
-    return decay
 
 
 # ════════════════════════════════════════════════
@@ -1090,13 +887,12 @@ def check_story_triggers(state, on_story=None):
 
 # 開始計時的函式
 def start_timer(state):
-    # 如果目前不處於計時狀況，就開始計時
     if not state.running:
-        # time.time()會回傳現在的時間戳記
-        # elapsed_time 是過去累積專注的時間
-        # 兩者相減用來處理暫停後繼續計時的讀書時數
         state.start_time = time.time() - state.elapsed_time
         state.running = True
+        # 全新開始才記錄 datetime（暫停後繼續不算）
+        if state.elapsed_time == 0:
+            state.session_start_dt = datetime.datetime.now()
 
 
 # 暫停計時的函數
@@ -1123,10 +919,25 @@ def do_pause(state, callbacks):
     # 更新上次讀書的日期
     state.last_study_date = today_str()
     # 儲存紀錄
-    save_session(state.game_data, state.total_time, actual_secs,
-                 state.session_count, state.average_time,
-                 state.total_exp, state.daily_exp,
-                 state.affection, state.daily_aff_gained, state.last_study_date)
+    # 換成這段：
+    if state.user_id and state.session_start_dt:
+        end_dt = datetime.datetime.now()
+        db_save_session(
+            user_id                 = state.user_id,
+            label_id                = None,
+            mode                    = '自訂',
+            target_duration         = int(actual_secs / 60),
+            start_time              = state.session_start_dt,
+            end_time                = end_dt,
+            total_distraction_count = 0,
+            total_distraction_time  = 0
+        )
+        update_exp_affection(
+            user_id         = state.user_id,
+            exp_delta       = int(exp_gained),
+            affection_delta = int(aff_gained)
+        )
+        state.session_start_dt = None
     # 把 elapsed_time 的值設回零(下一次計時用)
     state.elapsed_time = 0
     # 彈出視窗告訴玩家剛剛計時獲得的經驗值和好感度
@@ -1253,26 +1064,59 @@ def main():
     # 把state定義成之前設好的class
     state = AppState()
     
+    # ① 初始化資料庫
+    init_db()
 
-    #創建/載入遊戲資料
-    init_excel(state.game_data)
-    saved = load_excel_data(state.game_data)
-    # 把遊戲資料輸入到state裡
-    state.total_time       = saved["total_time"]
-    state.session_count    = saved["session_count"]
-    state.average_time     = saved["average_time"]
-    state.user_name        = saved["user_name"]
-    state.story_flags      = saved["story_flags"]
-    state.total_exp        = saved["total_exp"]
-    state.daily_exp        = saved["daily_exp"]
-    state.affection        = saved["affection"]
-    state.daily_aff_gained = saved["daily_aff_gained"]
-    state.last_study_date  = saved["last_study_date"]
-    state.today_chat_shown = saved["today_chat_shown"]
-    state.story_route      = saved["story_route"]
+    # ④ 好感度衰減（有 user_id 才做，新玩家沒有所以跳過）
+    decay_amount = 0.0
+    
+    # ② 收集所有劇情 id（給 load_story_flags_db 用）
+    all_story_ids = [STORY_PROLOGUE["id"]]
+    for route_stories in STORIES.values():
+        for s in route_stories:
+            all_story_ids.append(s["id"])
+            for b in s.get("branches", []):
+                all_story_ids.append(b["id"])
 
-    # 計算衰減的好感度
-    decay_amount = apply_daily_decay(state)
+    # 在 init_db() 之後加這段
+    # 嘗試讀取上次登入的使用者名稱
+    LAST_USER_FILE = "last_user.txt"
+    last_username = ""
+    if os.path.exists(LAST_USER_FILE):
+        with open(LAST_USER_FILE, "r", encoding="utf-8") as f:
+            last_username = f.read().strip()
+
+    if last_username:
+        uid = get_user_id(last_username)
+        if uid:
+            state.user_id   = uid
+            state.user_name = last_username
+            profile = get_user_profile(uid)
+            if profile:
+                state.total_exp        = profile["exp"]
+                state.affection        = profile["affection"]
+                state.story_route      = profile["story_route"]
+                state.today_chat_shown = profile["today_chat_shown"]
+                if profile["last_study_time"]:
+                    state.last_study_date = profile["last_study_time"].strftime("%Y-%m-%d")
+            state.story_flags = load_story_flags_db(uid, all_story_ids)
+            stats = get_session_stats_db(uid)
+            state.session_count = stats["session_count"]
+            state.total_time    = stats["total_hours"] * 60
+            state.average_time  = stats["avg_duration"] * 60
+
+            # 好感度衰減
+            decayed = check_affection_decay(uid)
+            if decayed:
+                db_data = get_exp_affection(uid)
+                state.affection = db_data["affection"]
+                decay_amount = 5.0
+
+
+    # ③ 如果有 username 的 cookie 可以用，暫時先不處理
+    # （新玩家走序章流程，老玩家在下面判斷）
+    # 這裡先把 user_id 設為 None，等輸入名字後才拿到
+    state.user_id = None
 
     # 創建基礎視窗
     root = tk.Tk()
@@ -1523,9 +1367,9 @@ def main():
 
         update_time()
 
+        # 改成這樣
         def on_pause():
-            do_pause(state, {"on_pause": _after_pause, "on_story": trigger_story},
-                     planned_secs=0, distraction_count=0)
+            do_pause(state, {"on_pause": _after_pause, "on_story": trigger_story})
 
         def _after_pause(exp_gained, aff_gained):
             elapsed_lbl.config(text="00:00:00")
@@ -1561,10 +1405,12 @@ def main():
 
             def on_finished():
                 state.story_flags[parent_id] = True
-                save_story_flag(state.game_data, parent_cell, True)
-                if branch_id and branch_cell:
+                if state.user_id:
+                    save_story_flag_db(state.user_id, parent_id, True)
+                if branch_id:
                     state.story_flags[branch_id] = True
-                    save_story_flag(state.game_data, branch_cell, True)
+                    if state.user_id:
+                        save_story_flag_db(state.user_id, branch_id, True)
                 play_next_story()
 
             show_story(story_def, state.user_name,
@@ -1582,13 +1428,13 @@ def main():
             s0 = STORY_PROLOGUE
             def on_finished():
                 state.story_flags[s0["id"]] = True
-                save_story_flag(state.game_data, s0["excel_cell"], True)
+                if state.user_id:
+                    save_story_flag_db(state.user_id, s0["id"], True)
                 _after_prologue()
-            def on_no_finish():
-                save_story_flag(state.game_data, s0["excel_cell"], False)
             show_story(s0, state.user_name, story_frame, timer_frame,
                        route="romance",   # 序章用乙女向風格（共用）
-                       on_no_finish=on_no_finish, on_finished=on_finished)
+                       on_finished=on_finished)  # 👈 乾淨俐落，只留 on_finished
+
 
         def _after_prologue():
             """序章結束後：輸入名字 → 選路線 → 計時器。"""
@@ -1630,7 +1476,43 @@ def main():
             name = name_var.get().strip()
             if not name: return
             state.user_name = name
-            save_user_name(state.game_data, name)
+
+            # 記住這次登入的名字
+            with open("last_user.txt", "w", encoding="utf-8") as f:
+                f.write(name)
+
+            # 查或建 user_id
+            uid = get_user_id(name)
+            if uid is None:
+                uid = register_user(name)
+            state.user_id = uid
+
+            # 從資料庫載入這個使用者的所有資料
+            if state.user_id:
+                profile = get_user_profile(state.user_id)
+                if profile:
+                    state.total_exp        = profile["exp"]
+                    state.affection        = profile["affection"]
+                    state.story_route      = profile["story_route"]
+                    state.today_chat_shown = profile["today_chat_shown"]
+                    if profile["last_study_time"]:
+                        state.last_study_date = profile["last_study_time"].strftime("%Y-%m-%d")
+
+                # 載入劇情旗標
+                state.story_flags = load_story_flags_db(state.user_id, all_story_ids)
+
+                # 載入 session 統計
+                stats = get_session_stats_db(state.user_id)
+                state.session_count = stats["session_count"]
+                state.total_time    = stats["total_hours"] * 60  # 分鐘轉秒
+                state.average_time  = stats["avg_duration"] * 60
+
+                # 好感度衰減
+                decayed = check_affection_decay(state.user_id)
+                if decayed:
+                    db_data = get_exp_affection(state.user_id)
+                    state.affection = db_data["affection"]
+
             if back_fn: back_fn()
         tk.Button(input_frame, text="確認",
                   font=("Helvetica Neue", 14, "bold"),
@@ -1679,7 +1561,8 @@ def main():
             def make_choose(rk=route_key):
                 def choose():
                     state.story_route = rk
-                    save_story_route(state.game_data, rk)
+                    if state.user_id:
+                        save_story_route_db(state.user_id, rk)
                     if back_fn: back_fn()
                 return choose
 
@@ -1718,8 +1601,10 @@ def main():
         m_total = int((state.total_time % 3600) // 60)
         total_str = f"{h_total}h {m_total:02d}m" if h_total else f"{m_total} 分"
         avg_m = int(state.average_time // 60);  avg_s = int(state.average_time % 60)
-        sessions = load_session_history(state.game_data)
-        max_m = max((time_str_to_sec(t) for t in sessions), default=0) // 60
+        # 從資料庫讀最近5筆（單位：分鐘）
+        recent_mins = get_recent_sessions_db(state.user_id, n=5) if state.user_id else []
+        stats_db    = get_session_stats_db(state.user_id) if state.user_id else {}
+        max_m       = stats_db.get("max_duration", 0)
         big_card(grid, 0, 0, "累積讀書時間", total_str)
         big_card(grid, 0, 1, "平均每次時長", f"{avg_m}:{avg_s:02d}", "分鐘")
         big_card(grid, 1, 0, "計時次數", str(state.session_count), "次")
@@ -1748,9 +1633,9 @@ def main():
         chart_card.pack(fill="x", padx=20)
         fig, ax = plt.subplots(figsize=(4.5, 1.8), dpi=90)
         fig.patch.set_facecolor(C["surface"]); ax.set_facecolor(C["surface"])
-        last5 = sessions[-5:] if sessions else []
+        last5 = recent_mins   # 已經是分鐘數的 list，不需要再轉換
         if last5:
-            mins = [time_str_to_min(t) for t in last5]
+            mins = last5      # ← 直接用，不需要 time_str_to_min
             x = range(1, len(mins) + 1)
             ax.bar(x, mins,
                    color=[C["pink"] if i == len(mins)-1 else C["pink_light"] for i in range(len(mins))],
@@ -1957,7 +1842,8 @@ def main():
             if idx >= len(messages):
                 if not state.today_chat_shown:
                     state.today_chat_shown = True
-                    save_today_chat_shown(state.game_data)
+                    if state.user_id:
+                        save_today_chat_shown_db(state.user_id, True)
                 scroll_to_bottom(); return
             add_char_bubble(messages[idx]); scroll_to_bottom()
             chat_frame.after(800, lambda: show_messages(messages, idx + 1))
